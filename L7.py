@@ -1,16 +1,9 @@
-#@title L7 Auto-PDE 一键版：轨道 + 律 + 结构
+# ============================================================
+# L7-SCCT-NGT (Paper Edition)
+#   Structural Compression Complexity Theory - Neural Grammar Tree
+#   时间结构守恒曲线（Φ², H, K=Φ²/H）
+# ============================================================
 
-# ============================================================
-# 0. 安装 PySR（符号回归）并优先导入，避免 torch 先导入的警告
-# ============================================================
-!pip install pysr sympy --quiet
-
-from pysr import PySRRegressor
-import sympy as sp
-
-# ============================================================
-# 1. 常用库
-# ============================================================
 import numpy as np
 import torch
 import torch.nn as nn
@@ -20,72 +13,85 @@ import matplotlib.pyplot as plt
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 
-# ============================================================
-# 2. 网格 + 真实 Teacher PDE（隐藏 u_x 项）
-# ============================================================
+# -----------------------------
+# 1. Grid & Initial condition
+# -----------------------------
 Lx = 1.0
 Nx = 64
 dx = Lx / (Nx - 1)
 dt = 1e-4
-Nt_teacher = 3000
+Nt_teacher = 2000
 T = Nt_teacher * dt
-x = torch.linspace(0, Lx, Nx, device=device)
 
-torch.manual_seed(1)
-u0 = torch.sin(2 * np.pi * x) + 0.05 * torch.randn_like(x)
+x = torch.linspace(0.0, Lx, Nx, device=device)
 
-def laplace_x_dirichlet(u, dx):
-    l = torch.zeros_like(u)
-    l[1:-1] = (u[2:] - 2*u[1:-1] + u[:-2]) / (dx**2)
-    return l
+# Slight random perturbation (to break symmetry)
+torch.manual_seed(0)
+u0 = torch.sin(np.pi * x) + 0.05 * torch.randn_like(x)
 
-def teacher_rhs(u):
-    """真实 PDE 的 RHS（包含隐藏 u_x 项）"""
-    u_xx = laplace_x_dirichlet(u, dx)
-    u_x = torch.zeros_like(u)
-    u_x[1:-1] = (u[2:] - u[:-2]) / (2*dx)
-    rhs = 0.85 * u_xx + 0.4 * u - u**3 - 0.15 * u_x  # 真正 PDE
-    return rhs, u_x, u_xx
+print(f"[Grid] Nx={Nx}, dx={dx:.3e}, dt={dt:.3e}, Nt={Nt_teacher}, T={T:.3f}")
 
-def real_teacher_step(u):
-    rhs, _, _ = teacher_rhs(u)
-    u_new = u + dt * rhs
-    u_new[0] = u_new[-1] = 0.0
-    return u_new
-
-# 生成 Teacher 轨道（用于终态对比 + PySR 数据）
-u = u0.clone()
-teacher_traj = []
-for _ in range(Nt_teacher):
-    teacher_traj.append(u.clone())
-    u = real_teacher_step(u)
-uT_true = u.clone()
-teacher_traj = torch.stack(teacher_traj, dim=0)  # [Nt_teacher, Nx]
-print(f"[Real Teacher] Generated u(T={T:.3f})")
-
-# ============================================================
-# 3. 结构量：SCCT φ² & H
-# ============================================================
+# -----------------------------
+# 2. SCCT stats
+# -----------------------------
 def scct_stats_torch(u, num_bins=64):
-    """φ² = mean(u²), H = histogram 熵"""
     u_flat = u.view(-1)
     phi2 = torch.mean(u_flat**2)
     v = torch.abs(u_flat)
     vmax = torch.max(v)
     if vmax < 1e-12:
-        return phi2, torch.tensor(0.0, device=device)
+        return phi2, torch.tensor(0.0, device=u.device)
     v_norm = v / vmax
     hist = torch.histc(v_norm, bins=num_bins, min=0.0, max=1.0)
     p = hist / (hist.sum() + 1e-12)
     H = -torch.sum(p * torch.log(p + 1e-12))
     return phi2, H
 
-φ2_true_T, H_true_T = scct_stats_torch(uT_true)
-print(f"[Teacher end] φ2_true={φ2_true_T:.3e}, H_true={H_true_T:.3f}")
+# -----------------------------
+# 3. Teacher PDE (slightly mismatched)
+#     u_t = 0.82 u_xx + 0.5 u - u^3
+# -----------------------------
+def laplace_x_dirichlet(u, dx):
+    l = torch.zeros_like(u)
+    l[1:-1] = (u[2:] - 2*u[1:-1] + u[:-2]) / (dx**2)
+    l[0] = 0.0
+    l[-1] = 0.0
+    return l
 
-# ============================================================
-# 4. L7 模型：core + γ·f_ngt(u, u_x, u_xx)
-# ============================================================
+def teacher_step(u):
+    u_xx = laplace_x_dirichlet(u, dx)
+    rhs = 0.82 * u_xx + 0.5 * u - u**3
+    u_new = u + dt * rhs
+    u_new[0] = 0.0
+    u_new[-1] = 0.0
+    return u_new
+
+def simulate_teacher(u0, Nt):
+    u = u0.clone()
+    traj, phi2s, Hs = [], [], []
+    for _ in range(Nt):
+        u = teacher_step(u)
+        phi2, H = scct_stats_torch(u)
+        traj.append(u.clone())
+        phi2s.append(phi2.item())
+        Hs.append(H.item())
+    return torch.stack(traj), np.array(phi2s), np.array(Hs)
+
+with torch.no_grad():
+    teacher_traj, phi2_true_traj, H_true_traj = simulate_teacher(u0, Nt_teacher)
+    uT_true = teacher_traj[-1]
+    phi2_true_T = phi2_true_traj[-1]
+    H_true_T = H_true_traj[-1]
+
+print(f"[Teacher] Φ²_true={phi2_true_T:.3e}, H_true={H_true_T:.3e}")
+
+meta_window = 400
+phi2_true_mean_meta = phi2_true_traj[:meta_window].mean()
+H_true_mean_meta = H_true_traj[:meta_window].mean()
+
+# -----------------------------
+# 4. Neural Grammar Tree
+# -----------------------------
 class NeuralGrammarTree(nn.Module):
     def __init__(self, feat_dim=3, hidden=16):
         super().__init__()
@@ -94,30 +100,34 @@ class NeuralGrammarTree(nn.Module):
         self.combine = nn.Linear(2*hidden, 1)
 
     def forward(self, u):
-        # 构造特征 [u, u_x, u_xx]
         u_xx = laplace_x_dirichlet(u, dx)
         u_x = torch.zeros_like(u)
         u_x[1:-1] = (u[2:] - u[:-2]) / (2*dx)
-        feat = torch.stack([u, u_x, u_xx], dim=-1)  # [Nx, 3]
+        feat = torch.stack([u, u_x, u_xx], dim=-1)
         h1 = torch.tanh(self.node1(feat))
         h2 = torch.tanh(self.node2(feat))
         h = torch.cat([h1, h2], dim=-1)
-        return self.combine(h).squeeze(-1)  # [Nx]
+        return self.combine(h).squeeze(-1)
 
+# -----------------------------
+# 5. SCCT-NGT model
+# -----------------------------
 class SCCT_NGT(nn.Module):
     def __init__(self):
         super().__init__()
         self.tree = NeuralGrammarTree()
-        self.gamma = nn.Parameter(torch.tensor(0.05))  # 可学习 γ
+        self.gamma = nn.Parameter(torch.tensor(0.05))  # nonzero init
 
     def pde_rhs(self, u):
         u_xx = laplace_x_dirichlet(u, dx)
-        core = 0.8 * u_xx + 0.4 * u - u**3  # 已知 core
-        return core + self.gamma * self.tree(u)
+        core = 0.8 * u_xx + 0.5 * u - u**3
+        f_ngt = self.tree(u)
+        return core + self.gamma * f_ngt
 
     def step(self, u):
         u_new = u + dt * self.pde_rhs(u)
-        u_new[0] = u_new[-1] = 0.0
+        u_new[0] = 0.0
+        u_new[-1] = 0.0
         return u_new
 
     def simulate_final(self, u0, Nt):
@@ -127,227 +137,95 @@ class SCCT_NGT(nn.Module):
         phi2, H = scct_stats_torch(u)
         return u, phi2, H
 
-# ============================================================
-# 5. 三模式训练：pair / mask / meta
-# ============================================================
-def train_mode(mode, epochs=100):
-    model = SCCT_NGT().to(device)
-    opt = torch.optim.Adam(model.parameters(), lr=3e-3)
-    λ_scct = {"pair": 0.0, "mask": 1e-2, "meta": 5e-2}[mode]
+    def simulate_traj_scct(self, u0, Nt):
+        u = u0.clone()
+        phi2s, Hs = [], []
+        for _ in range(Nt):
+            u = self.step(u)
+            phi2, H = scct_stats_torch(u)
+            phi2s.append(phi2)
+            Hs.append(H)
+        return torch.stack(phi2s), torch.stack(Hs)
 
-    for ep in range(1, epochs + 1):
+# -----------------------------
+# 6. Training (pair/mask/meta)
+# -----------------------------
+def train_scct_ngt_mode(mode, epochs=80, print_every=10):
+    model = SCCT_NGT().to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=5e-3)
+
+    λ_pair, λ_mask, λ_meta = 0.0, 1e-2, 5e-2
+    λ_γ, λ_time = 1e-3, 1e-2
+
+    for ep in range(1, epochs+1):
         opt.zero_grad()
-        u_pred, φ2, H = model.simulate_final(u0, Nt_teacher)
-        loss = F.mse_loss(u_pred, uT_true)
-        # 结构约束（只对 mask/meta 为正）
-        if λ_scct > 0:
-            loss += λ_scct * (torch.abs(φ2 - φ2_true_T) + torch.abs(H - H_true_T))
-        # γ 正则，鼓励找到“必要的”残差律
-        loss += 1e-3 * torch.abs(model.gamma)
+        u_pred_T, φ2_pred, H_pred = model.simulate_final(u0, Nt_teacher)
+        misfit = F.mse_loss(u_pred_T, uT_true)
+        loss = misfit
+
+        if mode == "pair":
+            lam_scct = λ_pair
+        elif mode == "mask":
+            lam_scct = λ_mask
+        else:
+            lam_scct = λ_meta
+
+        if lam_scct > 0:
+            loss_scct_T = torch.abs(φ2_pred - phi2_true_T) + torch.abs(H_pred - H_true_T)
+            loss += lam_scct * loss_scct_T
+
+        if mode == "meta":
+            φ2_t, H_t = model.simulate_traj_scct(u0, meta_window)
+            loss_time = (φ2_t.mean() - phi2_true_mean_meta)**2 + (H_t.mean() - H_true_mean_meta)**2
+            loss += λ_time * loss_time
+
+        loss += λ_γ * torch.abs(model.gamma)
         loss.backward()
         opt.step()
 
-        if ep % 30 == 0 or ep <= 3:
-            print(f"[{mode}] Ep {ep:3d} | loss={loss.item():.2e} | γ={model.gamma.item():+.3f}")
+        if ep % print_every == 0 or ep == 1:
+            print(f"[{mode:5s}] Epoch {ep:03d} | loss={loss.item():.3e}, misfit={misfit.item():.3e}, "
+                  f"φ2={φ2_pred.item():.3e}, H={H_pred.item():.3e}, γ={model.gamma.item():+.3e}")
     return model
 
 print("\n[Training L7 modes...]")
-model_pair = train_mode("pair", 80)
-model_mask = train_mode("mask", 80)
-model_meta = train_mode("meta", 120)
+model_pair = train_scct_ngt_mode("pair")
+model_mask = train_scct_ngt_mode("mask")
+model_meta = train_scct_ngt_mode("meta")
 
-# ============================================================
-# 6. 训练结果（meta）+ 结构终态
-# ============================================================
-with torch.no_grad():
-    u_final, φ2_final, H_final = model_meta.simulate_final(u0, Nt_teacher)
-    misfit = F.mse_loss(u_final, uT_true).item()
-
-print(f"\n[L7 Final/meta] misfit={misfit:.2e}, "
-      f"φ2={φ2_final:.3e}, H={H_final:.3f}, γ={model_meta.gamma.item():+.3f}")
-print(f"[Teacher  end ] φ2_true={φ2_true_T:.3e}, H_true={H_true_T:.3f}")
-
-print("\n[Learned f_ngt weights (meta) - parameter means]")
-for name, p in model_meta.tree.named_parameters():
-    print(f"  {name:20s}: mean={p.data.mean():+.3e}")
-
-# ============================================================
-# 7. 结构视角 & 轨道：Teacher vs meta-L7 rollout
-# ============================================================
-def rollout_teacher(u0, steps):
+# -----------------------------
+# 7. L7 Visualizer
+# -----------------------------
+def run_dynamics(model, steps=400):
     u = u0.clone()
-    traj = []
-    φ2s, Hs = [], []
+    φ2s, Hs, Ks = [], [], []
     with torch.no_grad():
         for _ in range(steps):
-            traj.append(u.detach().cpu().numpy())
-            φ2, H = scct_stats_torch(u)
-            φ2s.append(φ2.item())
-            Hs.append(H.item())
-            u = real_teacher_step(u)
-    return np.array(traj), np.array(φ2s), np.array(Hs)
-
-def rollout_model(model, u0, steps):
-    u = u0.clone()
-    traj = []
-    φ2s, Hs = [], []
-    with torch.no_grad():
-        for _ in range(steps):
-            traj.append(u.detach().cpu().numpy())
-            φ2, H = scct_stats_torch(u)
-            φ2s.append(φ2.item())
-            Hs.append(H.item())
             u = model.step(u)
-    return np.array(traj), np.array(φ2s), np.array(Hs)
+            φ2, H = scct_stats_torch(u)
+            φ2s.append(φ2.item())
+            Hs.append(H.item())
+            Ks.append(φ2.item() / (H.item() + 1e-12))
+    return np.array(φ2s), np.array(Hs), np.array(Ks)
 
-Nt_vis = 1000
-print("\n[Visualizer] Running rollout: Teacher vs meta-L7 ...")
-teacher_traj_vis, φ2_teacher, H_teacher = rollout_teacher(u0, Nt_vis)
-meta_traj_vis,    φ2_meta_v, H_meta_v   = rollout_model(model_meta, u0, Nt_vis)
+print("\n[Running L7 Visualizer simulations...]")
+steps_vis = 400
+results = {}
+for name, model in zip(["pair", "mask", "meta"], [model_pair, model_mask, model_meta]):
+    φ2s, Hs, Ks = run_dynamics(model, steps_vis)
+    results[name] = (φ2s, Hs, Ks)
+    print(f"  [{name}] Φ²_mean={φ2s.mean():.3e}, H_mean={Hs.mean():.3e}, K≈{Ks.mean():.3e}")
 
-err_t = np.mean((meta_traj_vis - teacher_traj_vis)**2, axis=1)
-t_vis = np.arange(Nt_vis) * dt
-K_t = φ2_meta_v / (φ2_teacher + 1e-12)
+t_vis = np.arange(steps_vis) * dt
 
-print(f"[Visualizer/meta] mean L2 error over time = {err_t.mean():.2e}")
-print(f"[Visualizer/meta] final L2 error          = {err_t[-1]:.2e}")
-print(f"[Visualizer/meta] K(t) mean               = {K_t.mean():.3f}")
+plt.figure(figsize=(12,4))
+for i, (title, idx) in enumerate(zip([r"$\Phi^2(t)$", "H(t)", "K(t)=Φ²/H"], [0,1,2])):
+    plt.subplot(1,3,i+1)
+    for md, c in zip(["pair","mask","meta"], ["r","g","b"]):
+        plt.plot(t_vis, results[md][idx], c, label=md)
+    plt.title(title)
+    plt.xlabel("t")
+    plt.legend()
+plt.tight_layout()
+plt.show()
 
-# ---- 图 1: Φ²(t) 对比 ----
-plt.figure(figsize=(10,4))
-plt.plot(t_vis, φ2_teacher, 'k',  label='Teacher Φ²(t)')
-plt.plot(t_vis, φ2_meta_v, 'b--', label='meta Φ²(t)')
-plt.xlabel("t"); plt.ylabel("Φ²")
-plt.title("Teacher vs meta-L7: Φ²(t) rollout")
-plt.legend(); plt.tight_layout(); plt.show()
-
-# ---- 图 2: H(t) 对比 ----
-plt.figure(figsize=(10,4))
-plt.plot(t_vis, H_teacher, 'k',  label='Teacher H(t)')
-plt.plot(t_vis, H_meta_v, 'b--', label='meta H(t)')
-plt.xlabel("t"); plt.ylabel("H")
-plt.title("Teacher vs meta-L7: H(t) rollout")
-plt.legend(); plt.tight_layout(); plt.show()
-
-# ---- 图 3: K(t) & L2 error(t) ----
-plt.figure(figsize=(10,4))
-plt.subplot(1,2,1)
-plt.plot(t_vis, K_t, 'g')
-plt.axhline(1.0, color='k', linestyle='--')
-plt.xlabel("t"); plt.ylabel("K(t)=Φ²_L7/Φ²_Teacher")
-plt.title("K(t) structure ratio")
-
-plt.subplot(1,2,2)
-plt.plot(t_vis, err_t, 'r')
-plt.xlabel("t"); plt.ylabel("L2 error")
-plt.title("L2(u_L7 - u_teacher)^2 over time")
-plt.tight_layout(); plt.show()
-
-# ---- 图 4: 若干时间截面 u(x,t) 对比 ----
-snap_ids = [0, Nt_vis//3, 2*Nt_vis//3, Nt_vis-1]
-plt.figure(figsize=(12,8))
-xx = x.cpu().numpy()
-for i, sid in enumerate(snap_ids, 1):
-    plt.subplot(2, 2, i)
-    plt.plot(xx, teacher_traj_vis[sid], 'k',  label='Teacher')
-    plt.plot(xx, meta_traj_vis[sid],    'b--', label='meta')
-    plt.title(f"u(x, t={sid*dt:.3f})")
-    if i == 1:
-        plt.legend()
-plt.tight_layout(); plt.show()
-
-# ============================================================
-# 8. 律 Part 1：Teacher 残差律（true_rhs - core）
-# ============================================================
-print("\n[Law Discovery] Building dataset from Teacher (residual: true_rhs - core) ...")
-
-Nt_data = min(800, Nt_teacher)  # 只取前面一段，避免全躺平
-us = teacher_traj[:Nt_data]     # [Nt_data, Nx]
-
-feat_list = []
-resid_list = []
-
-with torch.no_grad():
-    for u in us:
-        u = u.to(device)
-        rhs_true, u_x, u_xx = teacher_rhs(u)
-        core = 0.8 * u_xx + 0.4 * u - u**3
-        resid = rhs_true - core  # 真残差 = 0.05*u_xx - 0.15*u_x
-
-        feat = torch.stack([u, u_x, u_xx], dim=-1)  # [Nx, 3]
-        feat_list.append(feat.view(-1, 3))
-        resid_list.append(resid.view(-1))
-
-features_true = torch.cat(feat_list, dim=0).cpu().numpy()   # [N,3]
-residual_true = torch.cat(resid_list, dim=0).cpu().numpy()  # [N]
-print("Teacher residual dataset:", features_true.shape, residual_true.shape)
-
-variable_names = ["u", "u_x", "u_xx"]
-
-true_resid_model = PySRRegressor(
-    niterations=120,
-    binary_operators=["+", "-", "*"],
-    unary_operators=[],
-    maxsize=10,
-    populations=20,
-    procs=0,
-    model_selection="best",
-    progress=True,
-)
-
-true_resid_model.fit(features_true, residual_true, variable_names=variable_names)
-
-print("\n[True Residual Law from Teacher (SymPy)]")
-true_resid_sym = true_resid_model.sympy()
-print("residual_true(u, u_x, u_xx) ≈", true_resid_sym)
-print("\n[True Residual Law LaTeX]")
-print(true_resid_model.latex())
-
-# ============================================================
-# 9. 律 Part 2：L7 meta 学到的残差律（γ · f_ngt）
-# ============================================================
-print("\n[Law Discovery] Building dataset from L7 meta (γ * f_ngt) ...")
-
-feat_list_ngt = []
-ngt_list = []
-
-with torch.no_grad():
-    for u in us:
-        u = u.to(device)
-        f_ngt = model_meta.gamma * model_meta.tree(u)  # [Nx]
-
-        u_xx = laplace_x_dirichlet(u, dx)
-        u_x = torch.zeros_like(u)
-        u_x[1:-1] = (u[2:] - u[:-2]) / (2*dx)
-        feat = torch.stack([u, u_x, u_xx], dim=-1)
-
-        feat_list_ngt.append(feat.view(-1, 3))
-        ngt_list.append(f_ngt.view(-1))
-
-features_ngt = torch.cat(feat_list_ngt, dim=0).cpu().numpy()
-rhs_ngt = torch.cat(ngt_list, dim=0).cpu().numpy()
-print("L7 residual dataset:", features_ngt.shape, rhs_ngt.shape)
-
-ngt_resid_model = PySRRegressor(
-    niterations=120,
-    binary_operators=["+", "-", "*"],
-    unary_operators=[],
-    maxsize=10,
-    populations=20,
-    procs=0,
-    model_selection="best",
-    progress=True,
-)
-
-ngt_resid_model.fit(features_ngt, rhs_ngt, variable_names=variable_names)
-
-print("\n[L7 Learned Residual Law (SymPy)]")
-ngt_resid_sym = ngt_resid_model.sympy()
-print("residual_L7(u, u_x, u_xx) ≈", ngt_resid_sym)
-print("\n[L7 Learned Residual Law LaTeX]")
-print(ngt_resid_model.latex())
-
-print("\nDone. 现在你有：")
-print("  - 轨道：Teacher vs meta-L7 rollout + 误差 + 截面图")
-print("  - 结构：Φ²(t), H(t), K(t) 对比")
-print("  - 律：Teacher 残差律 & L7 学到的残差律（符号形式）")
