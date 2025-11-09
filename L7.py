@@ -1,10 +1,13 @@
 # ============================================================
-# L7-SCCT-NGT (Paper Edition, Colab Version)
-#   轨道 + 结构(Φ², H, K=Φ²/H) + 律 (PySR 符号回归)
+# L7-SCCT-NGT (Colab Clean Version, ASCII only)
+#   Orbit + Structure (phi2, H, K) + Law (PySR)
 #   Teacher PDE: u_t = 0.82 u_xx + 0.5 u - u^3
 #   Core PDE  : u_t = 0.80 u_xx + 0.5 u - u^3
-#   → 隐藏残差: r_true = 0.02 u_xx
+#   → Hidden residual: r_true = 0.02 u_xx
 # ============================================================
+
+# 0. Install deps (Colab)
+!pip install -q pysr sympy
 
 import numpy as np
 import torch
@@ -13,7 +16,7 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 
 from pysr import PySRRegressor
-from sympy import symbols
+from sympy import symbols, sympify
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
@@ -37,12 +40,12 @@ u0 = torch.sin(np.pi * x) + 0.05 * torch.randn_like(x)
 print(f"[Grid] Nx={Nx}, dx={dx:.3e}, dt={dt:.3e}, Nt={Nt_teacher}, T={T:.3f}")
 
 # -----------------------------
-# 2. SCCT stats: Φ² & H
+# 2. SCCT stats: phi2 & H
 # -----------------------------
 def scct_stats_torch(u, num_bins=64):
     """
-    Φ² = mean(u^2)
-    H  = -∑ p log p, p 来自 |u| 归一化后的直方图
+    phi2 = mean(u^2)
+    H    = -∑ p log p,  p 来自 |u| 归一化后的直方图
     """
     u_flat = u.view(-1)
     phi2 = torch.mean(u_flat**2)
@@ -104,7 +107,7 @@ with torch.no_grad():
     phi2_true_T = phi2_true_traj[-1]
     H_true_T = H_true_traj[-1]
 
-print(f"[Teacher] Φ²_true(T)={phi2_true_T:.3e}, H_true(T)={H_true_T:.3e}")
+print(f"[Teacher] phi2_true(T)={phi2_true_T:.3e}, H_true(T)={H_true_T:.3e}")
 
 meta_window = 400
 phi2_true_mean_meta = phi2_true_traj[:meta_window].mean()
@@ -182,31 +185,31 @@ def train_scct_ngt_mode(mode, epochs=80, print_every=10):
     model = SCCT_NGT().to(device)
     opt = torch.optim.Adam(model.parameters(), lr=5e-3)
 
-    λ_scct_dict = {"pair": 0.0, "mask": 1e-2, "meta": 5e-2}
-    λ_γ = 1e-3
-    λ_time = 1e-2
+    scct_weight = {"pair": 0.0, "mask": 1e-2, "meta": 5e-2}
+    lambda_gamma = 1e-3
+    lambda_time = 1e-2
 
     for ep in range(1, epochs+1):
         opt.zero_grad()
-        u_pred_T, φ2_pred, H_pred = model.simulate_final(u0, Nt_teacher)
+        u_pred_T, phi2_pred, H_pred = model.simulate_final(u0, Nt_teacher)
         misfit = F.mse_loss(u_pred_T, uT_true)
         loss = misfit
 
-        λ_scct = λ_scct_dict[mode]
+        lam_scct = scct_weight[mode]
 
         # 终时刻结构约束
-        if λ_scct > 0:
-            loss_scct_T = torch.abs(φ2_pred - phi2_true_T) + torch.abs(H_pred - H_true_T)
-            loss = loss + λ_scct * loss_scct_T
+        if lam_scct > 0:
+            loss_scct_T = torch.abs(phi2_pred - phi2_true_T) + torch.abs(H_pred - H_true_T)
+            loss = loss + lam_scct * loss_scct_T
 
         # 全时窗结构约束（meta 模式）
         if mode == "meta":
-            φ2_t, H_t = model.simulate_traj_scct(u0, meta_window)
-            loss_time = (φ2_t.mean() - phi2_true_mean_meta)**2 + (H_t.mean() - H_true_mean_meta)**2
-            loss = loss + λ_time * loss_time
+            phi2_t, H_t = model.simulate_traj_scct(u0, meta_window)
+            loss_time = (phi2_t.mean() - phi2_true_mean_meta)**2 + (H_t.mean() - H_true_mean_meta)**2
+            loss = loss + lambda_time * loss_time
 
-        # γ 正则：鼓励残差强度不要乱飙
-        loss = loss + λ_γ * torch.abs(model.gamma)
+        # gamma 正则：鼓励残差强度不要乱飙
+        loss = loss + lambda_gamma * torch.abs(model.gamma)
 
         loss.backward()
         opt.step()
@@ -215,8 +218,8 @@ def train_scct_ngt_mode(mode, epochs=80, print_every=10):
             print(
                 f"[{mode:5s}] Epoch {ep:03d} | "
                 f"loss={loss.item():.3e}, misfit={misfit.item():.3e}, "
-                f"Φ²(T)={φ2_pred.item():.3e}, H(T)={H_pred.item():.3e}, "
-                f"γ={model.gamma.item():+.3e}"
+                f"phi2(T)={phi2_pred.item():.3e}, H(T)={H_pred.item():.3e}, "
+                f"gamma={model.gamma.item():+.3e}"
             )
     return model
 
@@ -226,27 +229,27 @@ model_mask = train_scct_ngt_mode("mask")
 model_meta = train_scct_ngt_mode("meta")
 
 # -----------------------------
-# 7. L7 Visualizer: 结构 (Φ², H, K=Φ²/H)
+# 7. L7 Visualizer: 结构 (phi2, H, K=phi2/H)
 # -----------------------------
 def run_dynamics(model, steps=400):
     u = u0.clone()
-    φ2s, Hs, Ks = [], [], []
+    phi2s, Hs, Ks = [], [], []
     with torch.no_grad():
         for _ in range(steps):
             u = model.step(u)
-            φ2, H = scct_stats_torch(u)
-            φ2s.append(φ2.item())
+            phi2, H = scct_stats_torch(u)
+            phi2s.append(phi2.item())
             Hs.append(H.item())
-            Ks.append(φ2.item() / (H.item() + 1e-12))
-    return np.array(φ2s), np.array(Hs), np.array(Ks)
+            Ks.append(phi2.item() / (H.item() + 1e-12))
+    return np.array(phi2s), np.array(Hs), np.array(Ks)
 
 print("\n[Running L7 Visualizer simulations...]")
 steps_vis = 400
 results = {}
 for name, model in zip(["pair", "mask", "meta"], [model_pair, model_mask, model_meta]):
-    φ2s, Hs, Ks = run_dynamics(model, steps_vis)
-    results[name] = (φ2s, Hs, Ks)
-    print(f"  [{name}] Φ²_mean={φ2s.mean():.3e}, H_mean={Hs.mean():.3e}, K_mean≈{Ks.mean():.3e}")
+    phi2s, Hs, Ks = run_dynamics(model, steps_vis)
+    results[name] = (phi2s, Hs, Ks)
+    print(f"  [{name}] phi2_mean={phi2s.mean():.3e}, H_mean={Hs.mean():.3e}, K_mean≈{Ks.mean():.3e}")
 
 t_vis = np.arange(steps_vis) * dt
 
@@ -297,11 +300,53 @@ for nm, e in zip(["pair", "mask", "meta"], [err_pair, err_mask, err_meta]):
     print(f"  {nm:5s}: {e.mean():.3e}")
 
 # -----------------------------
-# 9. 律：Teacher & L7(meta) 残差，用 PySR 拟合
+# 9. Law Discovery utils (静音 + 只打印 best law)
 # -----------------------------
+def fit_pysr_best(X, y, name="Model", niterations=2000, max_points=8000):
+    """
+    只输出 best law（按最小 loss 选），静音版本。
+    """
+    # 子采样，避免太慢
+    if X.shape[0] > max_points:
+        idx = np.random.choice(X.shape[0], max_points, replace=False)
+        X, y = X[idx], y[idx]
+
+    model = PySRRegressor(
+        niterations=niterations,
+        binary_operators=["+", "-", "*"],
+        unary_operators=[],
+        populations=15,
+        maxsize=10,
+        progress=False,   # 关闭进度条
+        verbosity=0,      # 关闭中间方程打印
+        model_selection="best",
+    )
+    model.fit(X, y, variable_names=["u", "u_x", "u_xx"])
+
+    eqs = model.equations_
+    best_idx = int(eqs["loss"].idxmin())
+    row = eqs.iloc[best_idx]
+    sym_expr = sympify(row["sympy_format"])
+
+    # 改变量名：x0,x1,x2 → u,u_x,u_xx
+    u_sym, ux_sym, uxx_sym = symbols("u u_x u_xx")
+    expr_phys = sym_expr.subs({
+        symbols("x0"): u_sym,
+        symbols("x1"): ux_sym,
+        symbols("x2"): uxx_sym,
+    })
+
+    print(f"\n[{name} - Best Law]")
+    print("  equation   :", row["equation"])
+    print("  loss       :", f"{row['loss']:.3e}")
+    print("  sympy(raw) :", sym_expr)
+    print("  sympy(phys):", expr_phys)
+
+    return model, expr_phys, row
+
 print("\n[Law Discovery] Building residual datasets for Teacher & L7(meta)...")
 
-# (a) Teacher 残差数据集
+# (a) Teacher 残差数据集: r_true = (0.82 - 0.8) * u_xx = 0.02 u_xx
 with torch.no_grad():
     Nt_samples = min(Nt_teacher, 200)
     us = teacher_traj[:Nt_samples].to(device)   # [Nt, Nx]
@@ -309,7 +354,6 @@ with torch.no_grad():
     for u in us:
         u_x = grad_x_centered(u, dx)
         u_xx = laplace_x_dirichlet(u, dx)
-        # 真正的残差 = (0.82 - 0.8) * u_xx = 0.02 u_xx
         r = (0.82 - 0.8) * u_xx
         X_list.append(torch.stack([u, u_x, u_xx], dim=-1))
         y_list.append(r)
@@ -318,37 +362,11 @@ with torch.no_grad():
 
 print(f"[Teacher Residual Dataset] X: {X_true.shape}, y: {y_true.shape}")
 
-model_true = PySRRegressor(
-    niterations=2400,
-    binary_operators=["+", "-", "*"],
-    unary_operators=[],
-    populations=15,
-    progress=True,
-    maxsize=10,
-    loss="loss(x, y) = (x - y)^2",
+model_true, expr_true_phys, row_true = fit_pysr_best(
+    X_true, y_true, name="Teacher Residual", niterations=1500
 )
-model_true.fit(X_true, y_true)
 
-print("\n[Teacher Residual - PySR Model]")
-print(model_true)
-print(model_true.equations_)
-
-u_sym, ux_sym, uxx_sym = symbols("u u_x u_xx")
-best_idx_true = int(model_true.equations_["loss"].idxmin())
-expr_true = model_true.sympy()[best_idx_true]
-expr_true = expr_true.subs({
-    symbols("x0"): u_sym,
-    symbols("x1"): ux_sym,
-    symbols("x2"): uxx_sym,
-})
-
-print("\n[True Residual Law (SymPy)]")
-print("r_true(u, u_x, u_xx) ≈", expr_true)
-
-print("\n[True Residual Law LaTeX]")
-print(model_true.latex()[best_idx_true])
-
-# (b) L7(meta) 残差数据集：r_L7 = γ * f_ngt(u, u_x, u_xx)
+# (b) L7(meta) 残差数据集：r_L7 = gamma * f_ngt(u, u_x, u_xx)
 with torch.no_grad():
     Nt_samples_meta = Nt_samples
     u_meta_traj = model_meta.simulate_traj_full(u0, Nt_samples_meta)  # [Nt, Nx]
@@ -364,39 +382,15 @@ with torch.no_grad():
     y_l7 = torch.cat(y_list, dim=0).cpu().numpy()
 
 print(f"\n[L7(meta) Residual Dataset] X: {X_l7.shape}, y: {y_l7.shape}")
-print(f"[L7(meta)] γ ≈ {model_meta.gamma.item():.3e}")
+print(f"[L7(meta)] gamma ≈ {model_meta.gamma.item():.3e}")
 
-model_l7 = PySRRegressor(
-    niterations=2400,
-    binary_operators=["+", "-", "*"],
-    unary_operators=[],
-    populations=15,
-    progress=True,
-    maxsize=10,
-    loss="loss(x, y) = (x - y)^2",
+model_l7, expr_l7_phys, row_l7 = fit_pysr_best(
+    X_l7, y_l7, name="L7(meta) Residual", niterations=1500
 )
-model_l7.fit(X_l7, y_l7)
 
-print("\n[L7(meta) Residual - PySR Model]")
-print(model_l7)
-print(model_l7.equations_)
-
-best_idx_l7 = int(model_l7.equations_["loss"].idxmin())
-expr_l7 = model_l7.sympy()[best_idx_l7]
-expr_l7 = expr_l7.subs({
-    symbols("x0"): u_sym,
-    symbols("x1"): ux_sym,
-    symbols("x2"): uxx_sym,
-})
-
-print("\n[L7 Learned Residual Law (SymPy)]")
-print("r_L7(u, u_x, u_xx) ≈", expr_l7)
-
-print("\n[L7 Learned Residual Law LaTeX]")
-print(model_l7.latex()[best_idx_l7])
-
-print("\nDone. 现在你有：")
+print("\nDone. 你现在有：")
 print("  - 轨道：Teacher vs L7 rollout + 误差（log 轴）")
-print("  - 结构：Φ²(t), H(t), K(t)=Φ²/H 三种模式对比")
-print("  - 律：Teacher 残差律 & L7(meta) 残差律的符号表达式（SymPy + LaTeX）")
+print("  - 结构：phi2(t), H(t), K(t)=phi2/H 三种模式对比")
+print("  - 律：Teacher 残差律 & L7(meta) 残差律的符号表达式（只打印 best law）")
+
 
